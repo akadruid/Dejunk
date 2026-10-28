@@ -12,6 +12,9 @@ local TickerManager = Addon:GetModule("TickerManager")
 --- @class Seller
 local Seller = Addon:GetModule("Seller")
 
+local EMPTY_SCAN_LIMIT = 5
+local sellableItems = {}
+
 -- ============================================================================
 -- Events
 -- ============================================================================
@@ -72,19 +75,39 @@ local function handleStaticPopup()
 end
 
 local function handleItem(item)
-  if not Items:IsItemStillInBags(item) then return end
-  if Items:IsItemLocked(item) then return end
+  if not Items:IsItemStillInBags(item) then return false end
+  if Items:IsItemLocked(item) then return false end
 
   C_Container.UseContainerItem(item.bag, item.slot)
   handleStaticPopup()
 
   EventManager:Fire(E.AttemptedToSellItem, item)
+  return true
 end
 
 local function tickerCallback()
-  local item = table.remove(Seller.items)
-  if not item then return Seller:Stop() end
-  handleItem(item)
+  -- Rebuild the list from the current bag cache on every tick. Items may appear
+  -- after MERCHANT_SHOW while bags are still updating, and cached entries may
+  -- become stale as items are sold.
+  local items = JunkFilter:GetSellableJunkItems(sellableItems)
+
+  if #items == 0 then
+    Seller.emptyScans = Seller.emptyScans + 1
+    if Seller.emptyScans >= EMPTY_SCAN_LIMIT then Seller:Stop() end
+    return
+  end
+
+  Seller.emptyScans = 0
+
+  -- Normal selling continues with the highest-value item. Safe Sell keeps the
+  -- original lowest-value-first behavior.
+  local item = Seller.safeSellRemaining and items[1] or items[#items]
+  if not handleItem(item) then return end
+
+  if Seller.safeSellRemaining then
+    Seller.safeSellRemaining = Seller.safeSellRemaining - 1
+    if Seller.safeSellRemaining <= 0 then Seller:Stop() end
+  end
 end
 
 -- ============================================================================
@@ -100,18 +123,23 @@ function Seller:Start(auto)
   end
 
   -- Get filtered items.
-  self.items = JunkFilter:GetSellableJunkItems()
+  local items = JunkFilter:GetSellableJunkItems()
 
   -- Return if no items.
-  if #self.items == 0 then
+  if #items == 0 then
     if not auto then Addon:Print(L.NO_JUNK_ITEMS_TO_SELL) end
     return
   end
 
-  -- Safe sell.
+  -- Safe sell. A missing value means there is no per-run limit.
+  self.safeSellRemaining = nil
   if StateManager:GetGlobalState().safeSell then
-    while #self.items > 12 do table.remove(self.items) end
+    self.safeSellRemaining = math.min(#items, 12)
   end
+
+  -- Wait through several empty scans before stopping. This allows delayed BAG_UPDATE
+  -- events and Dejunk's debounced cache refresh to catch up.
+  self.emptyScans = 0
 
   -- Start ticker.
   self.ticker = TickerManager:NewTicker(Addon:GetLatency(), tickerCallback)
@@ -126,13 +154,14 @@ function Seller:Stop()
 end
 
 function Seller:HandleItem(item)
-  if Addon:IsBusy() then return end
+  if Addon:IsBusy() then return false end
 
   if not Addon:IsAtMerchant() then
-    return Addon:Print(L.CANNOT_SELL_WITHOUT_MERCHANT)
+    Addon:Print(L.CANNOT_SELL_WITHOUT_MERCHANT)
+    return false
   end
 
-  handleItem(item)
+  return handleItem(item)
 end
 
 function Seller:IsBusy()
